@@ -10,7 +10,9 @@ python311Packages.buildPythonApplication {
     mcap_support_pkg
     py_mcap_pkg
     pyserial
+    pyserial-asyncio
     aero_sensor_protos_np_proto_py
+    aiohttp
   ];
   src = ./aero_logger;
 }

@@ -84,14 +84,13 @@
               after = [ "network.target" ];
 
               serviceConfig = {
+                After = [ "network.target" ];
                 ExecStart = "${pkgs.aero_sensor_logger_pkg}/bin/run.py /dev/ttyACM0 /dev/ttyACM1";
-                Restart = "always";
-                RestartSec = "5s";
-                KillSignal = "SIGINT";
-                Environment = "PYTHONUNBUFFERED=1";
+                ExecStop = "/bin/kill -9 $MAINPID";
+                Restart = "on-failure";
               };
 
-              install.wantedBy = [ "multi-user.target" ];
+              
             };
           };
         };

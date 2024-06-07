@@ -1,10 +1,9 @@
-
 #!/usr/bin/env python
 import asyncio
 import serial
 import serial_asyncio
 from aiohttp import web
-from utils import log_sensor_data, process_buffer
+# from utils import log_sensor_data, process_buffer
 from mcap_protobuf.writer import Writer
 from datetime import datetime
 import sys
@@ -16,9 +15,35 @@ import time
 import signal
 import atexit
 
-def close_writer(mcap_writer, writing_file):
-    mcap_writer.finish()
-    writing_file.close()
+
+import time
+import struct
+from aero_sensor_protos_np_proto_py.aero_sensor import aero_sensor_pb2
+
+start_new_log = False
+stop_current_log = False
+def log_sensor_data(mcap_logger, data, port_name):
+    msg = aero_sensor_pb2.aero_data()
+    msg.readings_pa.extend(data)
+    sensor_name = port_name.split("/")[-1]
+    
+    mcap_logger.write_message(
+        topic=msg.DESCRIPTOR.name + "_" + sensor_name + "_data",
+        message=msg,
+        log_time=int(time.time_ns()),
+        publish_time=int(time.time_ns()),
+    )
+
+async def append_sensor_data(queue, data, port_name):
+    await queue.put((data, port_name))
+
+def process_buffer(buffer):
+    """Extracts eight 32-bit floats from the buffer."""
+    if len(buffer) < 32:
+        raise ValueError("Buffer does not contain enough data for eight 32-bit floats.")
+    # Unpack 8 32-bit floats (4 bytes each) in little-endian order
+    floats = struct.unpack("<8f", buffer[:32])
+    return floats
 
 def open_new_writer():
     path_to_mcap = "."
@@ -39,12 +64,10 @@ def cleanup():
     if writing_file:
         writing_file.close()
 
-
 def handle_signal(signal, frame):
     print(f"Received signal {signal}, running cleanup...")
     cleanup()
     sys.exit(0)
-
 
 class Listener(asyncio.Protocol):
     def connection_made(self, transport):
@@ -68,7 +91,9 @@ class Listener(asyncio.Protocol):
             if len(after_hash) >= 46:
                 floats = process_buffer(after_hash[:32])
                 if self.logging_enabled:
-                    log_sensor_data(self.mcap_logger, floats, self.port_name)
+                    asyncio.get_event_loop().create_task(append_sensor_data(self.queue, floats, self.port_name))
+                    
+                    # log_sensor_data(self.queue, floats, self.port_name)
                     # print(floats)
                 self.buffer = after_hash[46:]
             else:
@@ -76,30 +101,27 @@ class Listener(asyncio.Protocol):
     def connection_lost(self, exc):
         print("Connection lost")
 
-    def setup_listener(self, mcap_logger, port_name, writing_file):
-        self.writing_file = writing_file
+    def setup_listener(self, queue, port_name):
         self.buffer = b""
-        self.mcap_logger = mcap_logger
+        self.queue = queue
         self.port_name = port_name
 
     def enable_queue(self):
-        self.mcap_logger, self.writing_file = open_new_writer()
         self.logging_enabled = True
 
     def disable_queue(self):
         self.logging_enabled = False
-        print("finishing")
-        self.mcap_logger.finish()
-
 
 async def handle_start(request):
-    listener.enable_queue()
-    listener2.enable_queue()
+    global start_new_log
+    start_new_log = True
     return web.Response(text="Queue appending started")
 
 async def handle_stop(request):
-    listener.disable_queue()
-    listener2.disable_queue()
+    global stop_current_log
+    stop_current_log = True
+    # listener.disable_queue()
+    # listener2.disable_queue()
     return web.Response(text="Queue appending stopped")
 
 async def handle_index(request):
@@ -153,10 +175,26 @@ async def init_http_server():
     ])
     return app
 
-# mcap_writer = 0
-# writing_file_test = 0
+async def worker(queue):
+    global start_new_log, stop_current_log
+    mcap_logger, writing_file = open_new_writer()
+    not_logging = False
+    while True:
+        message = await queue.get()  # Wait until a message is available
+        if start_new_log:
+            mcap_logger, writing_file = open_new_writer()
+            start_new_log = False
+            not_logging = False
+        if stop_current_log:
+            mcap_logger.finish()
+            writing_file.close()
+            not_logging = True
+            stop_current_log = False
+        if not not_logging:
+            log_sensor_data(mcap_logger, message[0], message[1])
+        queue.task_done()  # Mark the task as done
+
 async def main():
-    mcap_writer, writing_file = open_new_writer()
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
     atexit.register(cleanup)
@@ -164,23 +202,26 @@ async def main():
     global listener, listener2
     loop = asyncio.get_running_loop()
     
+    
     # Set up serial connections
     ports = ['/dev/ttyACM0', '/dev/ttyACM1']
     coro1 = serial_asyncio.create_serial_connection(loop, Listener, ports[0], baudrate=500000)
-    coro2 = serial_asyncio.create_serial_connection(loop, Listener, ports[1], baudrate=9600)
+    coro2 = serial_asyncio.create_serial_connection(loop, Listener, ports[1], baudrate=500000)
     transport1, listener = await coro1
     transport2, listener2 = await coro2
     
     # Set shared queue
+    queue = asyncio.Queue()
     
-    listener.setup_listener(mcap_writer, ports[0], writing_file)
-    listener2.setup_listener(mcap_writer, ports[1], writing_file)
+    loop.create_task(worker(queue))
+    listener.setup_listener(queue, ports[0])
+    listener2.setup_listener(queue, ports[1])
     
     # Set up and run HTTP server
     app = await init_http_server()
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, 'localhost', 8080)
+    site = web.TCPSite(runner, '0.0.0.0', 4111)
     await site.start()
     
     print("HTTP server running on http://localhost:8080")
